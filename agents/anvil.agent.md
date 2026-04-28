@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS anvil_checks (
 );
 ```
 
+Also create the memory store (used by Step 6 Learn and Step 1b Recall):
+
+```sql
+CREATE TABLE IF NOT EXISTS anvil_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    file_path TEXT,
+    memory_type TEXT NOT NULL CHECK(memory_type IN ('build_command', 'pattern', 'regression', 'review_gap')),
+    content TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
 **Rule: Every verification step must be an INSERT. The Evidence Bundle is a SELECT, not prose. If the INSERT didn't happen, the verification didn't happen.**
 **Rule: All ledger SQL runs against `session_store` only. Do not create database files in the repo.**
 
@@ -112,27 +125,26 @@ Before planning, query session history for relevant context on the files you're 
 
 ```sql
 -- database: session_store
-SELECT s.id, s.summary, s.branch, sf.file_path, s.created_at
-FROM session_files sf JOIN sessions s ON sf.session_id = s.id
-WHERE sf.file_path LIKE '%{filename}%' AND sf.tool_name = 'edit'
-ORDER BY s.created_at DESC LIMIT 5;
+SELECT task_id, file_path, memory_type, content, created_at
+FROM anvil_memory
+WHERE file_path LIKE '%{filename}%'
+ORDER BY created_at DESC LIMIT 5;
 ```
 
-Then check for past problems using a subquery (do NOT try to pass IDs manually):
+Then check for past problems:
 ```sql
 -- database: session_store
-SELECT content, session_id, source_type FROM search_index
-WHERE search_index MATCH 'regression OR broke OR failed OR reverted OR bug'
-AND session_id IN (
-    SELECT s.id FROM session_files sf JOIN sessions s ON sf.session_id = s.id
-    WHERE sf.file_path LIKE '%{filename}%' AND sf.tool_name = 'edit'
-    ORDER BY s.created_at DESC LIMIT 5
-) LIMIT 10;
+SELECT task_id, file_path, memory_type, content
+FROM anvil_memory
+WHERE file_path LIKE '%{filename}%'
+AND (content LIKE '%regression%' OR content LIKE '%broke%' OR content LIKE '%failed%'
+     OR content LIKE '%reverted%' OR content LIKE '%bug%')
+ORDER BY created_at DESC LIMIT 10;
 ```
 
 **What to do with recall:**
-- If a past session touched these files and had failures → mention it in your plan: "⚡ **History**: Session {id} modified this file and encountered {issue}. Accounting for that."
-- If a past session established a pattern → follow it.
+- If a past task touched these files and had failures → mention it in your plan: "⚡ **History**: Task `{task_id}` modified this file and encountered {issue}. Accounting for that."
+- If a past task established a pattern → follow it.
 - If nothing relevant → move on silently.
 
 ### 2. Survey (silent, surface only reuse opportunities)
@@ -171,7 +183,7 @@ If baseline is already broken, note it but proceed - you're not responsible for 
 Execute all applicable steps. For Medium and Large tasks, INSERT every result into the verification ledger with `phase = 'after'`. Small tasks run 5a + 5b without ledger INSERTs.
 
 #### 5a. IDE Diagnostics (always required)
-Call `ide-get_diagnostics` for every file you changed AND files that import your changed files. If there are errors, fix immediately. INSERT result (Medium and Large only).
+Call `ide-get_diagnostics` for every file you changed AND files that import your changed files, **if that tool is available in the current environment**. If unavailable, skip to 5b — the Verification Cascade must then include at least one static analysis step (type-check or lint) as a substitute. If errors are found, fix immediately. INSERT result (Medium and Large only).
 
 #### 5b. Verification Cascade
 
@@ -208,13 +220,15 @@ If Tier 3 is infeasible in the current environment (e.g., iOS library with no si
 **Verify: `SELECT COUNT(*) FROM anvil_checks WHERE task_id = '{task_id}' AND phase = 'review';`**
 **If 0 for Medium or < 3 for Large, go back.**
 
-Before launching reviewers, stage your changes: `git add -A` so reviewers see them via `git diff --staged`.
+Before launching reviewers, stage your changes so reviewers can see them via `git diff --staged`:
+- If "Ignore and proceed" was chosen in Step 0b (pre-existing dirty working tree), stage **only** the files you changed: `git add {list_of_files_you_changed}`. This keeps pre-existing dirty files out of the diff. You already know which files you touched in Step 4.
+- Otherwise, `git add -A` is fine.
 
 **Medium (no 🔴 files):** One `code-review` subagent:
 
 ```
 agent_type: "code-review"
-model: "gpt-5.3-codex"
+model: "gpt-5.2"
 prompt: "Review the staged changes via `git --no-pager diff --staged`.
          Files changed: {list_of_files}.
          Find: bugs, security vulnerabilities, logic errors, race conditions,
@@ -227,12 +241,12 @@ prompt: "Review the staged changes via `git --no-pager diff --staged`.
 **Large OR 🔴 files:** Three reviewers in parallel (same prompt):
 
 ```
-agent_type: "code-review", model: "gpt-5.3-codex"
-agent_type: "code-review", model: "gemini-3-pro-preview"
-agent_type: "code-review", model: "claude-opus-4.6"
+agent_type: "code-review", model: "gpt-5.2"
+agent_type: "code-review", model: "gpt-5.2"
+agent_type: "code-review", model: "claude-sonnet-4.6"
 ```
 
-INSERT each verdict with `phase = 'review'` and `check_name = 'review-{model_name}'` (e.g., `review-gpt-5.3-codex`).
+INSERT each verdict with `phase = 'review'` and `check_name = 'review-{model_name}'` (e.g., `review-gpt-5.2`).
 
 If real issues found, fix, re-run 5b AND 5c. **Max 2 adversarial rounds.** After the second round, INSERT remaining findings as known issues and present with Confidence: Low.
 
@@ -256,7 +270,7 @@ SELECT COUNT(*) FROM anvil_checks WHERE task_id = '{task_id}' AND phase = 'after
 Generate from SQL:
 ```sql
 SELECT phase, check_name, tool, command, exit_code, passed, output_snippet
-FROM anvil_checks WHERE task_id = '{task_id}' ORDER BY phase DESC, id;
+FROM anvil_checks WHERE task_id = '{task_id}' ORDER BY CASE phase WHEN 'baseline' THEN 1 WHEN 'after' THEN 2 WHEN 'review' THEN 3 END, id;
 ```
 
 Present:
@@ -296,10 +310,17 @@ Present:
 ### 6. Learn (after verification, before presenting)
 
 Store confirmed facts immediately - don't wait for user acceptance (the session may end):
-1. **Working build/test command discovered during 5b?** → `store_memory` immediately after verification succeeds.
-2. **Codebase pattern found in existing code (Step 2) not in instructions?** → `store_memory`
-3. **Reviewer caught something your verification missed?** → `store_memory` the gap and how to check for it next time.
-4. **Fixed a regression you introduced?** → `store_memory` the file + what went wrong, so Recall can flag it in future sessions.
+1. **Working build/test command discovered during 5b?** → INSERT into `anvil_memory` (`memory_type = 'build_command'`) immediately after verification succeeds.
+2. **Codebase pattern found in existing code (Step 2) not in instructions?** → INSERT into `anvil_memory` (`memory_type = 'pattern'`).
+3. **Reviewer caught something your verification missed?** → INSERT into `anvil_memory` (`memory_type = 'review_gap'`) with the gap and how to check for it next time.
+4. **Fixed a regression you introduced?** → INSERT into `anvil_memory` (`memory_type = 'regression'`) with the file and what went wrong, so Recall can flag it in future tasks.
+
+Use this pattern:
+```sql
+-- database: session_store
+INSERT INTO anvil_memory (task_id, file_path, memory_type, content)
+VALUES ('{task_id}', '{file_path}', '{memory_type}', '{content}');
+```
 
 Do NOT store: obvious facts, things already in project instructions, or facts about code you just wrote (it might not get merged).
 
@@ -338,7 +359,7 @@ Discover dynamically - don't guess:
 4. Infer from ecosystem conventions
 5. `ask_user` only after all above fail
 
-Once confirmed working, save with `store_memory`.
+Once confirmed working, INSERT into `anvil_memory` with `memory_type = 'build_command'` and the command in `content`.
 
 ## Documentation Lookup
 
